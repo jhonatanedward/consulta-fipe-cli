@@ -2,7 +2,11 @@ package br.com.edward.consulta_fipe_cli.utils;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.github.resilience4j.decorators.Decorators;
+import io.github.resilience4j.ratelimiter.RateLimiter;
+import io.github.resilience4j.ratelimiter.RateLimiterConfig;
 import io.github.resilience4j.retry.Retry;
+import io.github.resilience4j.retry.RetryConfig;
 
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -12,17 +16,47 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.function.Supplier;
 
 public class HttpClientWrapper implements IHttpClient {
 
+    private static final String FIPE_RETRY = "FipeRetry";
+
+    private static final String FIPE_RATE_LIMITER = "FipeRateLimiter";
+
     private final HttpClient httpClient;
     private final ObjectMapper objectMapper;
+
+    private final Retry retry;
+    private final RateLimiter rateLimiter;
 
     public HttpClientWrapper() {
         this.httpClient = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofSeconds(10))
                 .build();
         this.objectMapper = new ObjectMapper();
+        retry = createRetry();
+        rateLimiter = createRateLimiter();
+        this.retry.getEventPublisher().onRetry(event ->
+                System.out.println("RETRY EVENT: Tentativa " + event.getNumberOfRetryAttempts() +
+                        " após falha: " + event.getLastThrowable().getMessage()));
+    }
+
+    private Retry createRetry() {
+        RetryConfig retryConfig = RetryConfig.custom()
+                .maxAttempts(5)
+                .waitDuration(Duration.ofSeconds(1))
+                .build();
+        return Retry.of(FIPE_RETRY, retryConfig);
+    }
+
+    private RateLimiter createRateLimiter() {
+        RateLimiterConfig rateLimiterConfig = RateLimiterConfig.custom()
+                .limitForPeriod(5)
+                .limitRefreshPeriod(Duration.ofSeconds(1))
+                .timeoutDuration(Duration.ofSeconds(1))
+                .build();
+        return RateLimiter.of(FIPE_RATE_LIMITER, rateLimiterConfig);
     }
 
     @Override
@@ -83,16 +117,33 @@ public class HttpClientWrapper implements IHttpClient {
     }
 
     private <T> T send(HttpRequest request, Class<T> responseType) {
-        try {
-            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
-            if (response.statusCode() >= 200 && response.statusCode() < 300) {
-                if(responseType == Void.class) return null;
-                return objectMapper.readValue(response.body(), responseType);
-            }else {
-                throw new RuntimeException("HTTP error: " + response.statusCode());
+        Supplier<T> httpCallSupplier = () -> {
+            try {
+                HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+                if (response.statusCode() >= 200 && response.statusCode() < 300) {
+                    if(responseType == Void.class) return null;
+                    return objectMapper.readValue(response.body(), responseType);
+                }else {
+                    throw new RuntimeException("HTTP error: " + response.statusCode());
+                }
+            } catch (Exception e) {
+                throw new RuntimeException("HTTP request failed", e);
             }
+        };
+
+        Supplier<T> decoratedSupplier = Decorators.ofSupplier(httpCallSupplier)
+                .withRateLimiter(rateLimiter)
+                .withRetry(retry)
+                .decorate();
+
+        try {
+            return decoratedSupplier.get();
+        } catch (io.github.resilience4j.ratelimiter.RequestNotPermitted e) {
+            // Exceção lançada quando o Rate Limiter não consegue adquirir uma permissão a tempo
+            throw new RuntimeException("Rate limit excedido: Demasiadas requisições em pouco tempo", e);
         } catch (Exception e) {
-            throw new RuntimeException("HTTP request failed", e);
+            // Captura qualquer exceção que venha após as 3 tentativas de Retry
+            throw new RuntimeException("HTTP request failed após todas as tentativas de Retry/Resiliência", e);
         }
     }
 }
